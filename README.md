@@ -4,12 +4,10 @@
 
 ---
 
-# 인트로
+# 프로젝트 개요
 
-본 보고서는 전체 함수 성능 향상을 목적으로 수행한 PA02 과제의 최종 코드 설명 및 실행 방법에 대한 안내서입니다.
-PA01에서는 `score_all()` 함수만을 대상으로 CPU 및 GPU 최적화를 수행하였습니다. 그러나 전체 프로파일링 결과 `Score()`, `Branch()` 함수가 여전히 주요 병목으로 나타났으며, 특정 함수의 성능 향상이 전체 matcher 성능 향상으로 항상 이어지는 것은 아님을 확인하였습니다.
-따라서 PA02에서는 개별 함수의 실행 시간뿐 아니라 함수 간 호출 구조와 trade-off를 함께 고려하여 최종 버전을 선정하였습니다.
-
+본 보고서는 전체 함수 성능 향상을 목적으로 수행한 PA02 과제의 최종 코드 설명 및 실행 방법에 대한 내용입니다.
+PA01에서는 `score_all()` 함수만을 대상으로 CPU 및 GPU 최적화를 수행하였습니다. 그러나 전체 프로파일링 결과 `Score()`, `Branch()` 함수가 여전히 주요 병목으로 나타났으며, 특정 함수의 성능 향상이 전체 matcher 성능 향상으로 항상 이어지는 것은 아님을 확인하였습니다. 따라서 PA02에서는 개별 함수의 실행 시간뿐 아니라 함수 간 호출 구조와 trade-off를 함께 고려하여 최종 버전을 선정하였습니다.
 현재 컨테이너에는 최종 보고서에서 채택한 버전만 반영되어 있으며, Jetson Nano 환경에서 실행 가능하도록 구성되어 있습니다.
 
 ---
@@ -44,7 +42,15 @@ nvprof --profile-child-processes \
 roslaunch cartographer_parallel cartographer_parallel_with_bag.launch ns:=student47
 ```
 
-bag 재생이 완료된 후 `Ctrl + C`를 입력하면 Time Profiling 및 Memory Profiling 결과를 확인할 수 있습니다.
+bag 재생이 완료된 후 `Ctrl + C`를 입력하면 Time Profiling 및 Memory Profiling 결과를 확인하실 수 있습니다.
+
+또한, 아래 경로를 통해 최종 코드를 확인할 수 있습니다.
+
+```bash
+nano /root/catkin_ws/src/cartographer_parallel/cartographer_parallel/src/fast_matcher.cpp
+
+nano /root/catkin_ws/src/cartographer_parallel/cartographer_parallel/src/score_all.cu
+```
 
 ---
 
@@ -68,14 +74,20 @@ bag 재생이 완료된 후 `Ctrl + C`를 입력하면 Time Profiling 및 Memory
 ```text
 MakeScans()
       ↓
-Branch()
+MakeBounds()
+      ↓
+MakeGridStack()
+      ↓
+MakeLowCands()
       ↓
 Score()
+      ↓
+Branch()
       ↓
 score_all()
 ```
 
-`MakeScans()`에서 yaw별 scan을 생성하고, `Branch()`가 탐색 공간을 계층적으로 줄입니다. 이후 `Score()`가 candidate를 정리하여 `score_all()`에 전달하고, `score_all()`이 GPU에서 실제 matching score를 계산합니다.
+실제 `MatchWithWindow()` 내부에서는 `MakeScans()`, `MakeBounds()`, `MakeGridStack()`, `MakeLowCands()`를 순서대로 수행한 뒤 coarse candidate에 대해 `Score()`를 수행합니다. 이후 `Branch()`가 탐색 공간을 계층적으로 분할하며 각 depth에서 `Score()`를 호출하고, `Score()` 내부에서 GPU `score_all()`을 호출하여 최종 score를 계산합니다.
 
 ---
 
@@ -120,6 +132,25 @@ function score_all(candidates, scan_points, grid):
     return candidates
 ```
 
+## 최종 버전 선정 이유
+
+`score_all()`은 모든 candidate에 대해 동일한 계산을 반복하는 데이터 병렬 구조를 가집니다. 따라서 GPU 병렬 처리에 적합하며, 실제 프로파일링에서도 전체 matcher 실행 시간의 상당 부분을 차지하였습니다.
+또한 CUDA default stream에서는 Host→Device 복사, Kernel 실행, Device→Host 복사가 순차적으로 수행되므로 kernel 직후의 `cudaDeviceSynchronize()`는 불필요하다고 판단하였습니다. 이에, 최종 버전에서는 해당 동기화를 제거하여 불필요한 대기 시간을 줄였습니다.
+
+## 수도코드에서 반영된 부분
+
+```text
+CUDA kernel 실행
+
+...
+
+cudaDeviceSynchronize() 호출 제거
+
+score 결과를 host로 복사
+```
+
+위 부분이 보고서에서 채택한 "default stream sync 제거" 최적화에 해당합니다.
+
 ---
 
 # Score() - Candidate Score 관리
@@ -162,6 +193,24 @@ function Score(candidates, scans):
     return candidates
 ```
 
+## 최종 버전 선정 이유
+
+`Score()` 함수는 matcher 전체에서 매우 많은 횟수로 호출됩니다. 프로파일링 결과 score 계산 자체보다 vector 생성 및 메모리 할당 비용이 반복적으로 발생하고 있음을 확인하였습니다. 따라서 매 호출마다 vector를 새로 생성하는 대신, 한 번 확보한 메모리를 재사용하는 방식을 채택하였습니다.
+
+## 수도코드에서 반영된 부분
+
+```text
+reserve()를 통해 필요한 메모리 확보
+
+...
+
+ids.clear()
+cx.clear()
+cy.clear()
+```
+
+`reserve()`로 필요한 메모리를 미리 확보한 뒤 `clear()`만 수행하여 기존 메모리를 재사용합니다.
+
 ---
 
 # Branch() - Branch and Bound 탐색
@@ -197,6 +246,11 @@ function Branch(candidates, depth):
 
     return best candidate
 ```
+
+## 최종 버전 선정 이유
+
+Branch 함수는 재귀 탐색과 pruning이 결합된 구조를 가집니다. 여러 개선을 시도하였으나 함수 자체의 실행 시간 감소가 전체 matcher 성능 향상으로 이어지지 않았으며, 오히려 pruning 효과가 감소하는 경우도 확인하였습니다. 따라서 최종적으로는 baseline 구현을 유지하였습니다.
+
 
 ---
 
@@ -241,9 +295,14 @@ function MakeScans(raw_points, yaw_values):
     return scans
 ```
 
+## 최종 버전 선정 이유
+
+Yaw별 scan 생성은 서로 독립적으로 수행되므로 병렬화가 가능합니다. 따라서 yaw loop에 OpenMP를 적용하여 여러 yaw를 동시에 계산하도록 하였습니다.
+다만, yaw 개수가 적은 경우에는 OpenMP thread 생성 비용이 오히려 더 크게 작용할 수 있으므로 threshold를 적용하였습니다. 실험 결과 threshold=8이 가장 좋은 성능을 보였으며 최종 버전으로 채택하였습니다.
+
 ---
 
-# 최종 결론
+# 결론
 
 본 최종 버전은 개별 함수의 실행 시간보다 전체 matcher 성능을 기준으로 선정하였습니다.
 
@@ -256,4 +315,4 @@ function MakeScans(raw_points, yaw_values):
 
 을 채택하였습니다.
 
-실험 결과 개별 함수의 성능 향상이 항상 전체 matcher 성능 향상으로 이어지는 것은 아니었으며, 함수 간 호출 구조와 데이터 흐름을 함께 고려한 프로파일링 기반 최적화가 중요함을 확인하였습니다.
+실험 결과 개별 함수의 성능 향상이 항상 전체 matcher 성능 향상으로 이어지는 것은 아니었으며, 함수 간 호출 구조와 데이터 흐름을 함께 고려한 프로파일링 기반 최적화가 중요함을 확인하였습니다. 특히 `Branch()`의 pruning 효과와 `Score()`의 호출 구조가 전체 성능에 큰 영향을 미쳤으며, 단순히 가장 느린 함수를 최적화하는 것보다 전체 호출 구조를 고려한 최적화가 중요함을 확인하였습니다.
