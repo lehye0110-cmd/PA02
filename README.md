@@ -4,40 +4,53 @@
 
 ---
 
-# 프로젝트 개요
+# 인트로
 
-본 프로젝트는 ROS 기반 Fast Correlative Scan Matcher(FCSM)의 성능 향상을 목적으로 수행한 PA02 과제의 최종 코드이다.
+본 보고서는 전체 함수 성능 향상을 목적으로 수행한 PA02 과제의 최종 코드 설명 및 실행 방법에 대한 안내서입니다.
+PA01에서는 `score_all()` 함수만을 대상으로 CPU 및 GPU 최적화를 수행하였습니다. 그러나 전체 프로파일링 결과 `Score()`, `Branch()` 함수가 여전히 주요 병목으로 나타났으며, 특정 함수의 성능 향상이 전체 matcher 성능 향상으로 항상 이어지는 것은 아님을 확인하였습니다.
+따라서 PA02에서는 개별 함수의 실행 시간뿐 아니라 함수 간 호출 구조와 trade-off를 함께 고려하여 최종 버전을 선정하였습니다.
 
-PA01에서는 `score_all()` 함수만을 대상으로 최적화를 수행하였으나, 전체 프로파일링 결과 `Score()`, `Branch()` 함수가 여전히 주요 병목으로 나타났다. 따라서 PA02에서는 개별 함수의 실행 시간뿐 아니라 함수 간 호출 구조와 trade-off를 함께 고려하여 최종 버전을 선정하였다.
-
-현재 저장소에는 최종 보고서에서 채택한 버전만 반영되어 있으며, Jetson Nano 환경에서 실행 가능하도록 구성되어 있다.
+현재 컨테이너에는 최종 보고서에서 채택한 버전만 반영되어 있으며, Jetson Nano 환경에서 실행 가능하도록 구성되어 있습니다.
 
 ---
 
 # 실행 방법
 
-Workspace 최상위 디렉토리에서 빌드한다.
+## 1. Jetson Nano 접속 및 Docker 컨테이너 실행
+
+Jetson Nano에 접속한 후 Docker 컨테이너를 실행합니다.
 
 ```bash
-catkin_make
-source devel/setup.bash
-```
+ssh -p 22 rcv@112.171.196.32
 
-Fast Correlative Matcher 실행
+ssh student_47@192.168.0.112
 
-```bash
-roslaunch cartographer_parallel fast_correlative.launch
-```
-
-rosbag 포함 실행
-
-```bash
-roslaunch cartographer_parallel cartographer_parallel_with_bag.launch
+sudo docker start student_47
+sudo docker exec -it student_47 /bin/bash
 ```
 
 ---
 
+## 2. ROS Launch 실행
+
+Docker 접속 후 아래 명령어를 실행합니다.
+
+```bash
+export ROS_MASTER_URI=http://localhost:11311
+export ROS_HOSTNAME=localhost
+unset ROS_IP
+
+nvprof --profile-child-processes \
+roslaunch cartographer_parallel cartographer_parallel_with_bag.launch ns:=student47
+```
+
+bag 재생이 완료된 후 `Ctrl + C`를 입력하면 Time Profiling 및 Memory Profiling 결과를 확인할 수 있습니다.
+
+---
+
 # 최종 적용된 최적화
+
+보고서 기준 최종 채택 버전은 다음과 같습니다.
 
 | 함수          | 최종 적용 버전                     |
 | ----------- | ---------------------------- |
@@ -45,6 +58,8 @@ roslaunch cartographer_parallel cartographer_parallel_with_bag.launch
 | Score()     | vector 재사용                   |
 | Branch()    | baseline 유지                  |
 | MakeScans() | OpenMP 병렬화 (threshold=8)     |
+
+보고서에서는 위 네 개 함수를 중심으로 최적화를 수행하였으며, 최종 코드 역시 해당 결과를 반영하였습니다.
 
 ---
 
@@ -60,22 +75,22 @@ Score()
 score_all()
 ```
 
-`MakeScans()`에서 yaw별 scan을 생성하고, `Branch()`가 탐색 공간을 계층적으로 줄인다. 이후 `Score()`가 candidate를 정리하여 `score_all()`에 전달하고, `score_all()`이 GPU에서 실제 matching score를 계산한다.
+`MakeScans()`에서 yaw별 scan을 생성하고, `Branch()`가 탐색 공간을 계층적으로 줄입니다. 이후 `Score()`가 candidate를 정리하여 `score_all()`에 전달하고, `score_all()`이 GPU에서 실제 matching score를 계산합니다.
 
 ---
 
 # score_all() - GPU Score 계산
 
-최종 적용
+## 최종 적용
 
 * GPU 사용
 * default stream sync 제거
 
-역할
+## 역할
 
-각 candidate pose에 대해 occupancy grid score를 계산한다.
+각 candidate pose에 대해 occupancy grid score를 계산합니다.
 
-수도코드
+## 수도코드
 
 ```text
 function score_all(candidates, scan_points, grid):
@@ -90,11 +105,11 @@ function score_all(candidates, scan_points, grid):
 
         각 thread는 scan point 일부를 담당
 
-        scan point를 grid에 투영
+        scan point를 occupancy grid에 투영
 
-        score를 누적
+        grid score 누적
 
-        reduction 수행
+        block 내부 reduction 수행
 
     cudaDeviceSynchronize() 호출 제거
 
@@ -109,28 +124,30 @@ function score_all(candidates, scan_points, grid):
 
 # Score() - Candidate Score 관리
 
-최종 적용
+## 최종 적용
 
 * vector 재사용
 
-역할
+## 역할
 
-candidate를 scan별로 분류하고 `score_all()` 호출을 관리한다.
+candidate를 scan별로 분류하고 `score_all()` 호출을 관리합니다.
 
-수도코드
+## 수도코드
 
 ```text
 function Score(candidates, scans):
 
     ids, cx, cy vector 생성
 
-    reserve() 수행
+    reserve()를 통해 필요한 메모리 확보
 
     for each scan:
 
         ids.clear()
         cx.clear()
         cy.clear()
+
+        기존 vector 메모리는 유지
 
         현재 scan에 해당하는 candidate 분류
 
@@ -149,15 +166,15 @@ function Score(candidates, scans):
 
 # Branch() - Branch and Bound 탐색
 
-최종 적용
+## 최종 적용
 
 * baseline 유지
 
-역할
+## 역할
 
-탐색 공간을 재귀적으로 분할하며 가능성이 낮은 candidate를 제거한다.
+탐색 공간을 재귀적으로 분할하며 가능성이 낮은 candidate를 제거합니다.
 
-수도코드
+## 수도코드
 
 ```text
 function Branch(candidates, depth):
@@ -172,7 +189,7 @@ function Branch(candidates, depth):
 
     upper bound score 계산
 
-    가능성이 있는 child만 유지
+    현재 best score보다 가능성이 있는 후보만 유지
 
     score 기준 정렬
 
@@ -185,16 +202,16 @@ function Branch(candidates, depth):
 
 # MakeScans() - Yaw별 Scan 생성
 
-최종 적용
+## 최종 적용
 
 * OpenMP 병렬화
 * threshold = 8
 
-역할
+## 역할
 
-입력 point cloud를 여러 yaw 각도로 회전시켜 scan 집합을 생성한다.
+입력 point cloud를 여러 yaw 각도로 회전시켜 scan 집합을 생성합니다.
 
-수도코드
+## 수도코드
 
 ```text
 function MakeScans(raw_points, yaw_values):
@@ -205,11 +222,17 @@ function MakeScans(raw_points, yaw_values):
 
             for each yaw:
 
-                모든 point 회전
+                current_scan 생성
 
-                scan 생성
+                for each point:
 
-                결과 저장
+                    yaw 만큼 회전
+
+                    grid 좌표로 변환
+
+                    current_scan에 저장
+
+                scans[yaw_index] 저장
 
     else:
 
@@ -222,11 +245,15 @@ function MakeScans(raw_points, yaw_values):
 
 # 최종 결론
 
-본 최종 버전은 함수 단위 실행 시간보다 전체 matcher 성능을 기준으로 선정하였다.
+본 최종 버전은 개별 함수의 실행 시간보다 전체 matcher 성능을 기준으로 선정하였습니다.
 
-* `score_all()` : GPU 계산
+최종적으로
+
+* `score_all()` : GPU 계산 + sync 제거
 * `Score()` : vector 재사용
 * `Branch()` : baseline 유지
 * `MakeScans()` : OpenMP 적용
 
-실험 결과, 개별 함수 성능 향상이 항상 전체 matcher 성능 향상으로 이어지는 것은 아니었으며, 함수 간 호출 구조와 데이터 흐름을 함께 고려하는 것이 중요함을 확인하였다.
+을 채택하였습니다.
+
+실험 결과 개별 함수의 성능 향상이 항상 전체 matcher 성능 향상으로 이어지는 것은 아니었으며, 함수 간 호출 구조와 데이터 흐름을 함께 고려한 프로파일링 기반 최적화가 중요함을 확인하였습니다.
